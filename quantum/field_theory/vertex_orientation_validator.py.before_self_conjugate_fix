@@ -1,0 +1,210 @@
+﻿from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+from .oriented_vertex_graph import (
+    TreeTopologyCandidate,
+    VertexInstance,
+    _normalize_particle,
+    conjugate,
+)
+
+
+@dataclass(frozen=True)
+class VertexOrientationResult:
+    vertex_instance: str
+    status: str
+    reasons: tuple[str, ...]
+
+
+def _normalized_fields(vertex: VertexInstance) -> set[str]:
+    return {
+        _normalize_particle(particle)
+        for particle in vertex.particles
+    }
+
+
+def _field_matches(vertex: VertexInstance, field: str) -> bool:
+    normalized = _normalize_particle(field)
+    fields = _normalized_fields(vertex)
+
+    if normalized in fields:
+        return True
+
+    conjugated = _normalize_particle(conjugate(normalized))
+
+    return conjugated in fields
+
+
+def _attachments_for_vertex(
+    candidate: TreeTopologyCandidate,
+    vertex_id: str,
+):
+    return tuple(
+        attachment
+        for attachment in candidate.external_attachments
+        if attachment.vertex_instance == vertex_id
+    )
+
+
+def _propagators_for_vertex(
+    candidate: TreeTopologyCandidate,
+    vertex_id: str,
+):
+    return tuple(
+        propagator
+        for propagator in candidate.internal_propagators
+        if (
+            propagator.vertex_a == vertex_id
+            or propagator.vertex_b == vertex_id
+        )
+    )
+
+
+def validate_vertex_orientation(
+    candidate: TreeTopologyCandidate,
+    vertex: VertexInstance,
+) -> VertexOrientationResult:
+    """
+    Validate only field/orientation compatibility.
+
+    This layer deliberately does NOT attempt to infer conservation laws
+    from the raw ordering of catalog particles.
+
+    ALLOWED:
+        Every represented attachment is compatible with a catalog field.
+
+    FORBIDDEN:
+        A definite field mismatch or malformed orientation is found.
+
+    UNDECIDABLE:
+        The graph does not contain enough orientation information to
+        establish the complete physical field interpretation.
+    """
+
+    forbidden: list[str] = []
+    undecidable: list[str] = []
+
+    attachments = _attachments_for_vertex(
+        candidate,
+        vertex.instance_id,
+    )
+
+    propagators = _propagators_for_vertex(
+        candidate,
+        vertex.instance_id,
+    )
+
+    # Every external attachment must correspond to one of the fields
+    # represented by this catalog vertex.
+    for attachment in attachments:
+        if not _field_matches(
+            vertex,
+            attachment.crossed_field,
+        ):
+            forbidden.append(
+                f"External leg {attachment.leg_id} has crossed field "
+                f"{attachment.crossed_field}, which is incompatible "
+                f"with vertex {vertex.catalog_vertex_id}."
+            )
+
+        if attachment.role not in {"incoming", "outgoing"}:
+            forbidden.append(
+                f"External leg {attachment.leg_id} has invalid role "
+                f"{attachment.role!r}."
+            )
+
+        physical = _normalize_particle(
+            attachment.physical_particle
+        )
+        crossed = _normalize_particle(
+            attachment.crossed_field
+        )
+
+        # A crossed field may represent either the particle itself or
+        # its conjugate depending on crossing convention. Therefore we
+        # explicitly permit both possibilities instead of imposing a
+        # false universal incoming/outgoing rule.
+        if physical != crossed:
+            if _normalize_particle(conjugate(physical)) != crossed:
+                undecidable.append(
+                    f"External leg {attachment.leg_id} uses "
+                    f"physical particle {physical} with crossed field "
+                    f"{crossed}; crossing interpretation requires "
+                    "fermion/boson field orientation."
+                )
+
+    # Internal propagators need an explicit orientation convention before
+    # they can be assigned a directed field interpretation.
+    for propagator in propagators:
+        if propagator.orientation is None:
+            undecidable.append(
+                f"Internal propagator {propagator.line_id} has no "
+                "explicit field orientation."
+            )
+
+    if forbidden:
+        return VertexOrientationResult(
+            vertex_instance=vertex.instance_id,
+            status="FORBIDDEN",
+            reasons=tuple(dict.fromkeys(forbidden)),
+        )
+
+    if undecidable:
+        return VertexOrientationResult(
+            vertex_instance=vertex.instance_id,
+            status="UNDECIDABLE",
+            reasons=tuple(dict.fromkeys(undecidable)),
+        )
+
+    return VertexOrientationResult(
+        vertex_instance=vertex.instance_id,
+        status="ALLOWED",
+        reasons=(
+            "External and represented field orientations are "
+            "compatible with the catalog vertex.",
+        ),
+    )
+
+
+def validate_candidate_vertex_orientations(
+    candidate: TreeTopologyCandidate,
+) -> tuple[VertexOrientationResult, ...]:
+    return tuple(
+        validate_vertex_orientation(candidate, vertex)
+        for vertex in candidate.vertices
+    )
+
+
+def candidate_orientation_status(
+    candidate: TreeTopologyCandidate,
+) -> tuple[str, tuple[str, ...]]:
+    """
+    Collapse all vertex-level results without discarding the candidate.
+    """
+
+    results = validate_candidate_vertex_orientations(candidate)
+
+    reasons: list[str] = []
+
+    if any(result.status == "FORBIDDEN" for result in results):
+        status = "FORBIDDEN"
+    elif any(result.status == "UNDECIDABLE" for result in results):
+        status = "UNDECIDABLE"
+    else:
+        status = "ALLOWED"
+
+    for result in results:
+        reasons.extend(result.reasons)
+
+    return status, tuple(dict.fromkeys(reasons))
+
+
+def validate_candidates_orientation(
+    candidates: Iterable[TreeTopologyCandidate],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return tuple(
+        candidate_orientation_status(candidate)
+        for candidate in candidates
+    )

@@ -1,0 +1,279 @@
+﻿from __future__ import annotations
+
+from dataclasses import dataclass
+from collections import Counter
+from typing import Iterable
+
+from .oriented_vertex_graph import (
+    TreeTopologyCandidate,
+    _catalog_vertices,
+    _normalize_particle,
+    conjugate,
+    is_fermion,
+    is_self_conjugate,
+)
+
+
+@dataclass(frozen=True)
+class PhysicalValidationResult:
+    candidate_id: str
+    status: str
+    allowed: bool | None
+    reasons: tuple[str, ...]
+
+
+def _charge(particle: str) -> int:
+    charges = {
+        "electron": -1,
+        "positron": 1,
+        "muon": -1,
+        "antimuon": 1,
+        "tau": -1,
+        "antitau": 1,
+        "up": 2,
+        "anti-up": -2,
+        "down": -1,
+        "anti-down": 1,
+        "strange": -1,
+        "anti-strange": 1,
+        "charm": 2,
+        "anti-charm": -2,
+        "bottom": -1,
+        "anti-bottom": 1,
+        "top": 2,
+        "anti-top": -2,
+        "neutrino_e": 0,
+        "antineutrino_e": 0,
+        "neutrino_mu": 0,
+        "antineutrino_mu": 0,
+        "neutrino_tau": 0,
+        "antineutrino_tau": 0,
+        "photon": 0,
+        "gluon": 0,
+        "z": 0,
+        "w_plus": 1,
+        "w_minus": -1,
+        "higgs": 0,
+    }
+    return charges.get(_normalize_particle(particle), 0)
+
+
+def _particle_catalog_vertices() -> set[tuple[str, ...]]:
+    return {
+        tuple(sorted(_normalize_particle(p) for p in vertex.particles))
+        for vertex in _catalog_vertices()
+    }
+
+
+def _vertex_is_catalog_valid(vertex) -> bool:
+    catalog = _particle_catalog_vertices()
+
+    fields = tuple(
+        sorted(
+            _normalize_particle(p)
+            for p in vertex.particles
+        )
+    )
+
+    if fields in catalog:
+        return True
+
+    conjugated = tuple(
+        sorted(
+            _normalize_particle(conjugate(p))
+            for p in vertex.particles
+        )
+    )
+
+    return conjugated in catalog
+
+
+def _external_charge_conserved(candidate: TreeTopologyCandidate) -> bool:
+    incoming_charge = sum(
+        _charge(attachment.physical_particle)
+        for attachment in candidate.external_attachments
+        if attachment.role == "incoming"
+    )
+
+    outgoing_charge = sum(
+        _charge(attachment.physical_particle)
+        for attachment in candidate.external_attachments
+        if attachment.role == "outgoing"
+    )
+
+    return incoming_charge == outgoing_charge
+
+
+def _external_legs_unique(candidate: TreeTopologyCandidate) -> bool:
+    ids = [
+        attachment.leg_id
+        for attachment in candidate.external_attachments
+    ]
+
+    return len(ids) == len(set(ids))
+
+
+def _external_attachment_vertices_exist(
+    candidate: TreeTopologyCandidate,
+) -> bool:
+    vertex_ids = {
+        vertex.instance_id
+        for vertex in candidate.vertices
+    }
+
+    return all(
+        attachment.vertex_instance in vertex_ids
+        for attachment in candidate.external_attachments
+    )
+
+
+def _propagator_vertices_exist(
+    candidate: TreeTopologyCandidate,
+) -> bool:
+    vertex_ids = {
+        vertex.instance_id
+        for vertex in candidate.vertices
+    }
+
+    return all(
+        propagator.vertex_a in vertex_ids
+        and propagator.vertex_b in vertex_ids
+        and propagator.vertex_a != propagator.vertex_b
+        for propagator in candidate.internal_propagators
+    )
+
+
+def _fermion_line_consistency(
+    candidate: TreeTopologyCandidate,
+) -> tuple[bool, str | None]:
+    for line in candidate.fermion_lines:
+        if not is_fermion(line.family):
+            return False, (
+                f"Fermion line {line.line_id} has non-fermionic "
+                f"family {line.family}."
+            )
+
+        if line.incoming_leg is None and line.outgoing_leg is None:
+            return False, (
+                f"Fermion line {line.line_id} has no external endpoint."
+            )
+
+    return True, None
+
+
+def _internal_propagators_valid(
+    candidate: TreeTopologyCandidate,
+) -> tuple[bool, str | None]:
+    for propagator in candidate.internal_propagators:
+        particle = _normalize_particle(propagator.particle)
+
+        if not particle:
+            return False, "An internal propagator has no particle field."
+
+        if propagator.vertex_a == propagator.vertex_b:
+            return False, (
+                f"Internal propagator {propagator.line_id} "
+                "connects a vertex to itself."
+            )
+
+    return True, None
+
+
+def validate_tree_topology(
+    candidate: TreeTopologyCandidate,
+) -> PhysicalValidationResult:
+    """
+    Generic physical validation of a generated tree topology.
+
+    The validator never removes candidates.
+
+    ALLOWED:
+        Structural and conservation checks pass.
+
+    FORBIDDEN:
+        A definite physical contradiction exists.
+
+    UNDECIDABLE:
+        The graph is structurally valid but available information is
+        insufficient to establish complete physical legality.
+    """
+
+    reasons: list[str] = []
+
+    if not candidate.vertices:
+        return PhysicalValidationResult(
+            candidate_id=candidate.candidate_id,
+            status="FORBIDDEN",
+            allowed=False,
+            reasons=("Candidate contains no vertices.",),
+        )
+
+    for vertex in candidate.vertices:
+        if not _vertex_is_catalog_valid(vertex):
+            reasons.append(
+                f"Vertex {vertex.catalog_vertex_id} is not present "
+                "in the Standard Model catalog."
+            )
+
+    if not _external_legs_unique(candidate):
+        reasons.append(
+            "An external leg is attached more than once."
+        )
+
+    if not _external_attachment_vertices_exist(candidate):
+        reasons.append(
+            "An external attachment references a missing vertex."
+        )
+
+    if not _propagator_vertices_exist(candidate):
+        reasons.append(
+            "An internal propagator references invalid vertex endpoints."
+        )
+
+    if not _external_charge_conserved(candidate):
+        reasons.append(
+            "Electric charge is not conserved between incoming "
+            "and outgoing external states."
+        )
+
+    fermion_ok, fermion_reason = _fermion_line_consistency(candidate)
+
+    if not fermion_ok and fermion_reason:
+        reasons.append(fermion_reason)
+
+    propagator_ok, propagator_reason = _internal_propagators_valid(candidate)
+
+    if not propagator_ok and propagator_reason:
+        reasons.append(propagator_reason)
+
+    if reasons:
+        return PhysicalValidationResult(
+            candidate_id=candidate.candidate_id,
+            status="FORBIDDEN",
+            allowed=False,
+            reasons=tuple(reasons),
+        )
+
+    return PhysicalValidationResult(
+        candidate_id=candidate.candidate_id,
+        status="ALLOWED",
+        allowed=True,
+        reasons=(
+            "Topology is structurally consistent with the Standard Model "
+            "vertex catalog and satisfies external electric-charge conservation.",
+        ),
+    )
+
+
+def validate_tree_topologies(
+    candidates: Iterable[TreeTopologyCandidate],
+) -> tuple[PhysicalValidationResult, ...]:
+    return tuple(
+        validate_tree_topology(candidate)
+        for candidate in candidates
+    )
+
+
+# Backward-compatible aliases used by earlier layers.
+validate_topology = validate_tree_topology
+validate_candidates = validate_tree_topologies

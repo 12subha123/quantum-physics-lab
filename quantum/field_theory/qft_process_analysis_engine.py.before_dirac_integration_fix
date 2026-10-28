@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+from typing import Any
+
+from quantum.field_theory.oriented_vertex_graph import (
+    search_tree_topologies,
+)
+from quantum.field_theory.physical_topology_validator import (
+    validate_tree_topologies,
+)
+from quantum.field_theory.feynman_rule_plan import (
+    build_feynman_rule_plans,
+)
+from quantum.field_theory.feynman_rule_assignment import (
+    assign_feynman_rules_batch,
+)
+from quantum.field_theory.symbolic_amplitude_builder import (
+    build_symbolic_amplitudes,
+)
+from quantum.field_theory.dirac_algebra import (
+    build_dirac_algebra,
+)
+from quantum.field_theory.dirac_trace_matrix_element import (
+    build_spin_summed_matrix_element,
+)
+
+
+@dataclass(frozen=True)
+class ProcessAnalysisResult:
+    process: str
+    incoming: tuple[str, ...]
+    outgoing: tuple[str, ...]
+    candidate_count: int
+    allowed_count: int
+    forbidden_count: int
+    undecidable_count: int
+    topology_results: tuple[dict[str, Any], ...]
+    rule_plans: tuple[dict[str, Any], ...]
+    assigned_rules: tuple[dict[str, Any], ...]
+    amplitudes: tuple[dict[str, Any], ...]
+    dirac_algebra: tuple[dict[str, Any], ...]
+    matrix_elements: tuple[dict[str, Any], ...]
+    status: str
+    reasons: tuple[str, ...]
+
+
+def _status_counts(
+    validations: list[Any],
+) -> tuple[int, int, int]:
+
+    allowed = 0
+    forbidden = 0
+    undecidable = 0
+
+    for result in validations:
+        status = getattr(result, "status", None)
+
+        if status == "ALLOWED":
+            allowed += 1
+        elif status == "FORBIDDEN":
+            forbidden += 1
+        elif status == "UNDECIDABLE":
+            undecidable += 1
+
+    return allowed, forbidden, undecidable
+
+
+def _normalize_process_particles(
+    particles: tuple[str, ...],
+) -> tuple[str, ...]:
+    aliases = {
+        "e-": "electron",
+        "e+": "positron",
+        "mu-": "muon",
+        "mu+": "antimuon",
+        "tau-": "tau",
+        "tau+": "antitau",
+        "nu_e": "electron_neutrino",
+        "anti_nu_e": "electron_antineutrino",
+        "nu_mu": "muon_neutrino",
+        "anti_nu_mu": "muon_antineutrino",
+        "nu_tau": "tau_neutrino",
+        "anti_nu_tau": "tau_antineutrino",
+        "u": "up",
+        "anti-u": "anti-up",
+        "d": "down",
+        "anti-d": "anti-down",
+        "s": "strange",
+        "anti-s": "anti-strange",
+        "c": "charm",
+        "anti-c": "anti-charm",
+        "b": "bottom",
+        "anti-b": "anti-bottom",
+        "t": "top",
+        "anti-t": "anti-top",
+        "g": "gluon",
+        "gamma": "photon",
+        "A": "photon",
+        "W+": "W+",
+        "W-": "W-",
+        "Z0": "Z",
+        "h": "Higgs",
+    }
+
+    return tuple(
+        aliases.get(particle, particle)
+        for particle in particles
+    )
+
+
+def analyze_process(
+    incoming: tuple[str, ...],
+    outgoing: tuple[str, ...],
+    max_vertices: int = 4,
+) -> ProcessAnalysisResult:
+
+    original_incoming = tuple(incoming)
+    original_outgoing = tuple(outgoing)
+
+    normalized_incoming = _normalize_process_particles(
+        original_incoming,
+    )
+    normalized_outgoing = _normalize_process_particles(
+        original_outgoing,
+    )
+
+    process = (
+        " ".join(original_incoming)
+        + " -> "
+        + " ".join(original_outgoing)
+    )
+
+    reasons: list[str] = []
+
+    candidates = search_tree_topologies(
+        incoming=normalized_incoming,
+        outgoing=normalized_outgoing,
+        max_vertices=max_vertices,
+    )
+
+    if not candidates:
+        return ProcessAnalysisResult(
+            process=process,
+            incoming=incoming,
+            outgoing=outgoing,
+            candidate_count=0,
+            allowed_count=0,
+            forbidden_count=0,
+            undecidable_count=0,
+            topology_results=(),
+            rule_plans=(),
+            assigned_rules=(),
+            amplitudes=(),
+            dirac_algebra=(),
+            matrix_elements=(),
+            status="UNDECIDABLE",
+            reasons=(
+                "No topology candidates were generated.",
+            ),
+        )
+
+    validations = validate_tree_topologies(candidates)
+
+    topology_results = tuple(
+        {
+            "candidate_id": candidate.candidate_id,
+            "topology": candidate.topology,
+            "process": candidate.process,
+            "status": validation.status,
+            "allowed": validation.allowed,
+            "reasons": list(validation.reasons),
+            "graph": asdict(candidate),
+        }
+        for candidate, validation in zip(
+            candidates,
+            validations,
+        )
+    )
+
+    allowed, forbidden, undecidable = _status_counts(
+        validations
+    )
+
+    rule_plans = build_feynman_rule_plans(
+        candidates,
+        validation_results=validations,
+    )
+
+    assigned_rules = assign_feynman_rules_batch(
+        rule_plans,
+    )
+
+    amplitudes = build_symbolic_amplitudes(
+        assigned_rules,
+    )
+
+    dirac_algebra = build_dirac_algebra(
+        amplitudes,
+    )
+
+    matrix_elements = build_spin_summed_matrix_element(
+        dirac_algebra,
+    )
+
+    if allowed > 0:
+        status = "ALLOWED_CANDIDATES_PRESENT"
+    elif undecidable > 0:
+        status = "UNDECIDABLE"
+        reasons.append(
+            "Candidates exist, but at least one physical "
+            "constraint remains unresolved."
+        )
+    else:
+        status = "FORBIDDEN"
+        reasons.append(
+            "All discovered topology candidates are forbidden."
+        )
+
+    return ProcessAnalysisResult(
+        process=process,
+        incoming=incoming,
+        outgoing=outgoing,
+        candidate_count=len(candidates),
+        allowed_count=allowed,
+        forbidden_count=forbidden,
+        undecidable_count=undecidable,
+        topology_results=topology_results,
+        rule_plans=tuple(
+            asdict(plan)
+            for plan in rule_plans
+        ),
+        assigned_rules=tuple(
+            asdict(rule)
+            for rule in assigned_rules
+        ),
+        amplitudes=tuple(
+            asdict(amplitude)
+            for amplitude in amplitudes
+        ),
+        dirac_algebra=tuple(
+            asdict(result)
+            for result in dirac_algebra
+        ),
+        matrix_elements=tuple(
+            asdict(result)
+            for result in matrix_elements
+        ),
+        status=status,
+        reasons=tuple(reasons),
+    )
+
+
+def process_analysis_dict(
+    result: ProcessAnalysisResult,
+) -> dict[str, Any]:
+
+    return asdict(result)
+

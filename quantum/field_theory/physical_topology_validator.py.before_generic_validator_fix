@@ -1,0 +1,378 @@
+﻿from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TopologyValidationResult:
+    valid: bool
+    process: str
+    accepted_channels: tuple[str, ...]
+    rejected_channels: tuple[str, ...]
+    errors: tuple[str, ...]
+
+
+def _n(value: str) -> str:
+    return value.strip().lower().replace("−", "-").replace("–", "-")
+
+
+def _process(initial: list[str] | tuple[str, ...],
+             final: list[str] | tuple[str, ...]) -> str:
+    return (
+        f"{initial[0]} + {initial[1]} "
+        f"-> {final[0]} + {final[1]}"
+    )
+
+
+def _same_pair(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    return (
+        initial[0] == final[0]
+        and initial[1] == final[1]
+    )
+
+
+def _annihilation_pair(
+    initial: tuple[str, str],
+) -> bool:
+    pairs = {
+        ("electron", "positron"),
+        ("muon", "antimuon"),
+        ("tau", "antitau"),
+        ("up", "anti-up"),
+        ("down", "anti-down"),
+        ("strange", "anti-strange"),
+        ("charm", "anti-charm"),
+        ("bottom", "anti-bottom"),
+        ("top", "anti-top"),
+        ("electron_neutrino", "electron_antineutrino"),
+        ("muon_neutrino", "muon_antineutrino"),
+        ("tau_neutrino", "tau_antineutrino"),
+    }
+    return initial in pairs
+
+
+def _charged_lepton(value: str) -> bool:
+    return value in {
+        "electron",
+        "positron",
+        "muon",
+        "antimuon",
+        "tau",
+        "antitau",
+    }
+
+
+def _same_lepton_flavor_pair(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    return (
+        initial[0] == final[0]
+        and initial[1] == final[1]
+        and _charged_lepton(initial[0])
+        and _charged_lepton(initial[1])
+    )
+
+
+def _qcd_qqbar_to_gg(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    quark_pairs = {
+        ("up", "anti-up"),
+        ("down", "anti-down"),
+        ("strange", "anti-strange"),
+        ("charm", "anti-charm"),
+        ("bottom", "anti-bottom"),
+        ("top", "anti-top"),
+    }
+
+    return initial in quark_pairs and final == ("gluon", "gluon")
+
+
+def _qed_distinct_flavor_annihilation(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    allowed_initial = {
+        ("electron", "positron"),
+        ("muon", "antimuon"),
+        ("tau", "antitau"),
+    }
+
+    allowed_final = {
+        ("electron", "positron"),
+        ("muon", "antimuon"),
+        ("tau", "antitau"),
+    }
+
+    return (
+        initial in allowed_initial
+        and final in allowed_final
+        and initial != final
+    )
+
+
+def _bhabha(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    return (
+        initial == ("electron", "positron")
+        and final == ("electron", "positron")
+    )
+
+
+def _moller(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    return (
+        initial == ("electron", "electron")
+        and final == ("electron", "electron")
+    )
+
+
+def _elastic_neutrino_lepton(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+) -> bool:
+    neutrinos = {
+        "electron_neutrino",
+        "muon_neutrino",
+        "tau_neutrino",
+    }
+
+    antineutrinos = {
+        "electron_antineutrino",
+        "muon_antineutrino",
+        "tau_antineutrino",
+    }
+
+    charged_leptons = {
+        "electron",
+        "muon",
+        "tau",
+        "positron",
+        "antimuon",
+        "antitau",
+    }
+
+    return (
+        initial == final
+        and (
+            (
+                initial[0] in charged_leptons
+                and initial[1] in neutrinos | antineutrinos
+            )
+            or (
+                initial[1] in charged_leptons
+                and initial[0] in neutrinos | antineutrinos
+            )
+        )
+    )
+
+
+def validate_channel(
+    initial: tuple[str, str],
+    final: tuple[str, str],
+    channel: str,
+    theory: str,
+    internal_particle: str,
+) -> tuple[bool, str | None]:
+
+    # ---------------------------------------------------------------
+    # QED charged-lepton annihilation.
+    # Only s-channel photon/Z-type exchange is allowed here.
+    # ---------------------------------------------------------------
+    if _qed_distinct_flavor_annihilation(initial, final):
+        if channel == "s":
+            return True, None
+
+        return False, (
+            "Distinct-flavor charged-lepton annihilation is "
+            "restricted to s-channel exchange."
+        )
+
+    # ---------------------------------------------------------------
+    # Bhabha scattering:
+    # e- e+ -> e- e+
+    # Tree-level neutral exchange gives s and t.
+    # ---------------------------------------------------------------
+    if _bhabha(initial, final):
+        if channel in {"s", "t"}:
+            return True, None
+
+        return False, "Bhabha scattering has no tree-level u-channel topology."
+
+    # ---------------------------------------------------------------
+    # Møller scattering:
+    # e- e- -> e- e-
+    # Identical-particle exchange gives t and u.
+    # ---------------------------------------------------------------
+    if _moller(initial, final):
+        if channel in {"t", "u"}:
+            return True, None
+
+        return False, "Møller scattering has no annihilation s-channel."
+
+    # ---------------------------------------------------------------
+    # QCD:
+    # q qbar -> g g
+    # s-channel gluon plus t/u quark exchange.
+    # ---------------------------------------------------------------
+    if _qcd_qqbar_to_gg(initial, final):
+        if theory != "QCD":
+            return False, "q qbar -> gg must be classified as QCD."
+
+        if channel not in {"s", "t", "u"}:
+            return False, "q qbar -> gg only has s, t and u tree channels."
+
+        if channel == "s" and internal_particle != "gluon":
+            return False, "The QCD s-channel must exchange a gluon."
+
+        if channel in {"t", "u"} and internal_particle not in {
+            initial[0],
+            initial[1],
+        }:
+            return False, (
+                "The QCD t/u channels must exchange the corresponding quark."
+            )
+
+        return True, None
+
+    # ---------------------------------------------------------------
+    # Elastic charged-lepton scattering.
+    # Generic same-flavor elastic process has t-channel neutral exchange.
+    # ---------------------------------------------------------------
+    if _same_lepton_flavor_pair(initial, final):
+        if channel in {"t", "u"}:
+            return True, None
+
+        return False, (
+            "Elastic charged-lepton scattering is restricted "
+            "to exchange channels."
+        )
+
+    # ---------------------------------------------------------------
+    # Charged-lepton/neutrino elastic scattering.
+    #
+    # Do not accept a generic u-channel candidate merely because
+    # individual vertex matching succeeded.
+    # ---------------------------------------------------------------
+    if _elastic_neutrino_lepton(initial, final):
+        if channel == "t":
+            return True, None
+
+        return False, (
+            "Elastic charged-lepton/neutrino scattering requires "
+            "a physically connected exchange topology; generic "
+            "u-channel crossing is rejected."
+        )
+
+    # ---------------------------------------------------------------
+    # Conservative fallback.
+    # Unknown processes are not declared physically valid.
+    # ---------------------------------------------------------------
+    return False, (
+        "No process-specific physical topology rule is registered "
+        "for this process yet."
+    )
+
+
+def validate_process_diagrams(
+    initial_particles: list[str] | tuple[str, ...],
+    final_particles: list[str] | tuple[str, ...],
+    diagrams: list[dict],
+) -> dict:
+
+    initial = tuple(_n(x) for x in initial_particles)
+    final = tuple(_n(x) for x in final_particles)
+
+    accepted = []
+    rejected = []
+    errors = []
+
+    for diagram in diagrams:
+        channel = diagram.get("channel", "")
+        theory = diagram.get("theory", "")
+        internal_particle = _n(
+            diagram.get("internal_particle", "")
+        )
+
+        valid, error = validate_channel(
+            initial,
+            final,
+            channel,
+            theory,
+            internal_particle,
+        )
+
+        if valid:
+            accepted.append(channel)
+        else:
+            rejected.append(channel)
+            if error:
+                errors.append(
+                    f"{channel}: {error}"
+                )
+
+    return {
+        "valid": bool(accepted),
+        "process": _process(initial, final),
+        "accepted_channels": accepted,
+        "rejected_channels": rejected,
+        "errors": errors,
+    }
+
+
+def filter_valid_diagrams(
+    initial_particles: list[str] | tuple[str, ...],
+    final_particles: list[str] | tuple[str, ...],
+    diagrams: list[dict],
+) -> tuple[list[dict], dict]:
+
+    initial = tuple(_n(x) for x in initial_particles)
+    final = tuple(_n(x) for x in final_particles)
+
+    valid_diagrams = []
+    rejected = []
+    errors = []
+
+    for diagram in diagrams:
+        channel = diagram.get("channel", "")
+        theory = diagram.get("theory", "")
+        internal_particle = _n(
+            diagram.get("internal_particle", "")
+        )
+
+        valid, error = validate_channel(
+            initial,
+            final,
+            channel,
+            theory,
+            internal_particle,
+        )
+
+        if valid:
+            valid_diagrams.append(diagram)
+        else:
+            rejected.append(diagram.get("diagram_id", channel))
+            if error:
+                errors.append(
+                    f"{diagram.get('diagram_id', channel)}: {error}"
+                )
+
+    validation = {
+        "valid": bool(valid_diagrams),
+        "process": _process(initial, final),
+        "accepted_diagrams": len(valid_diagrams),
+        "rejected_diagrams": len(rejected),
+        "rejected_ids": rejected,
+        "errors": errors,
+    }
+
+    return valid_diagrams, validation

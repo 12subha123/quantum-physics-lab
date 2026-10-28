@@ -1,0 +1,1411 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from itertools import combinations, product
+from typing import Iterable
+
+
+# ============================================================
+# Particle-field conventions
+# ============================================================
+
+SELF_CONJUGATE = {
+    "photon",
+    "gluon",
+    "z",
+    "higgs",
+    "scalar",
+}
+
+CONJUGATES = {
+    "electron": "positron",
+    "positron": "electron",
+    "muon": "antimuon",
+    "antimuon": "muon",
+    "tau": "antitau",
+    "antitau": "tau",
+    "up": "anti-up",
+    "anti-up": "up",
+    "down": "anti-down",
+    "anti-down": "down",
+    "strange": "anti-strange",
+    "anti-strange": "strange",
+    "charm": "anti-charm",
+    "anti-charm": "charm",
+    "bottom": "anti-bottom",
+    "anti-bottom": "bottom",
+    "top": "anti-top",
+    "anti-top": "top",
+    "neutrino_e": "antineutrino_e",
+    "antineutrino_e": "neutrino_e",
+    "neutrino_mu": "antineutrino_mu",
+    "antineutrino_mu": "neutrino_mu",
+    "neutrino_tau": "antineutrino_tau",
+    "antineutrino_tau": "neutrino_tau",
+    "w_plus": "w_minus",
+    "w_minus": "w_plus",
+}
+
+
+FERMIONS = {
+    "electron",
+    "positron",
+    "muon",
+    "antimuon",
+    "tau",
+    "antitau",
+    "up",
+    "anti-up",
+    "down",
+    "anti-down",
+    "strange",
+    "anti-strange",
+    "charm",
+    "anti-charm",
+    "bottom",
+    "anti-bottom",
+    "top",
+    "anti-top",
+    "neutrino_e",
+    "antineutrino_e",
+    "neutrino_mu",
+    "antineutrino_mu",
+    "neutrino_tau",
+    "antineutrino_tau",
+}
+
+
+FERMION_FAMILY = {
+    "electron": "electron",
+    "positron": "electron",
+    "muon": "muon",
+    "antimuon": "muon",
+    "tau": "tau",
+    "antitau": "tau",
+    "up": "up",
+    "anti-up": "up",
+    "down": "down",
+    "anti-down": "down",
+    "strange": "strange",
+    "anti-strange": "strange",
+    "charm": "charm",
+    "anti-charm": "charm",
+    "bottom": "bottom",
+    "anti-bottom": "bottom",
+    "top": "top",
+    "anti-top": "top",
+    "neutrino_e": "neutrino_e",
+    "antineutrino_e": "neutrino_e",
+    "neutrino_mu": "neutrino_mu",
+    "antineutrino_mu": "neutrino_mu",
+    "neutrino_tau": "neutrino_tau",
+    "antineutrino_tau": "neutrino_tau",
+}
+
+
+@dataclass(frozen=True)
+class ExternalLeg:
+    leg_id: str
+    particle: str
+    role: str
+    crossed_field: str
+
+
+@dataclass(frozen=True)
+class VertexInstance:
+    instance_id: str
+    catalog_vertex_id: str
+    particles: tuple[str, ...]
+    theory: str
+
+
+@dataclass(frozen=True)
+class ExternalAttachment:
+    leg_id: str
+    vertex_instance: str
+    physical_particle: str
+    crossed_field: str
+    role: str
+
+
+@dataclass(frozen=True)
+class InternalPropagator:
+    line_id: str
+    particle: str
+    field_type: str
+    vertex_a: str
+    vertex_b: str
+    orientation: str | None = None
+
+
+@dataclass(frozen=True)
+class FermionLine:
+    line_id: str
+    family: str
+    incoming_leg: str | None
+    outgoing_leg: str | None
+    start_vertex: str
+    end_vertex: str
+    orientation: str
+
+
+@dataclass(frozen=True)
+class TreeTopologyCandidate:
+    candidate_id: str
+    process: str
+    topology: str
+    theory: str
+    vertices: tuple[VertexInstance, ...]
+    external_attachments: tuple[ExternalAttachment, ...]
+    internal_propagators: tuple[InternalPropagator, ...]
+    fermion_lines: tuple[FermionLine, ...]
+    status: str
+    reason: str
+
+
+# Backwards-compatible name used by earlier modules.
+OrientedTopologyCandidate = TreeTopologyCandidate
+
+
+# ============================================================
+# Normalization
+# ============================================================
+
+def _normalize_particle(name: str) -> str:
+    """
+    Normalize particle aliases into the canonical names used by the
+    topology engine.
+    """
+    value = (
+        str(name)
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("???", "-")
+        .replace("???", "-")
+    )
+
+    aliases = {
+        # Electron-family neutrinos
+        "electron_neutrino": "neutrino_e",
+        "electron_antineutrino": "antineutrino_e",
+
+        # Muon-family neutrinos
+        "muon_neutrino": "neutrino_mu",
+        "muon_antineutrino": "antineutrino_mu",
+
+        # Tau-family neutrinos
+        "tau_neutrino": "neutrino_tau",
+        "tau_antineutrino": "antineutrino_tau",
+
+        # Charged weak bosons
+        "w+": "w_plus",
+        "w-": "w_minus",
+        "w_plus": "w_plus",
+        "w_minus": "w_minus",
+    }
+
+    return aliases.get(value, value)
+
+
+def conjugate(field: str) -> str:
+    field = _normalize_particle(field)
+    return CONJUGATES.get(field, field)
+
+
+def is_fermion(field: str) -> bool:
+    return _normalize_particle(field) in FERMIONS
+
+
+def is_self_conjugate(field: str) -> bool:
+    return _normalize_particle(field) in SELF_CONJUGATE
+
+
+def crossed_field(particle: str, role: str) -> str:
+    """
+    Convert a physical external leg into the field appearing in the
+    all-incoming vertex convention.
+
+    Incoming:
+        particle stays unchanged.
+
+    Outgoing:
+        fermionic particle is crossed into its conjugate field.
+
+    Self-conjugate bosons remain unchanged.
+    """
+    particle = _normalize_particle(particle)
+
+    if role == "incoming":
+        return particle
+
+    if role == "outgoing":
+        if is_self_conjugate(particle):
+            return particle
+        return conjugate(particle)
+
+    raise ValueError(f"Unknown external-leg role: {role}")
+
+
+# ============================================================
+# Catalog introspection
+# ============================================================
+
+def _load_catalog():
+    """
+    Load the Standard Model physical tree-level vertex catalog.
+
+    The loader intentionally accepts the existing catalog's public
+    representation without forcing the topology engine to depend on
+    one exact internal implementation.
+    """
+    from . import standard_model_vertices as sm
+
+    if hasattr(sm, "STANDARD_MODEL_VERTICES"):
+        return getattr(sm, "STANDARD_MODEL_VERTICES")
+
+    if hasattr(sm, "SM_VERTICES"):
+        return getattr(sm, "SM_VERTICES")
+
+    if hasattr(sm, "VERTICES"):
+        return getattr(sm, "VERTICES")
+
+    if hasattr(sm, "standard_model_vertices"):
+        value = getattr(sm, "standard_model_vertices")
+        return value() if callable(value) else value
+
+    if hasattr(sm, "get_standard_model_vertices"):
+        return sm.get_standard_model_vertices()
+
+    raise RuntimeError(
+        "Could not locate the Standard Model vertex catalog. "
+        "Expected STANDARD_MODEL_VERTICES, SM_VERTICES, VERTICES, "
+        "standard_model_vertices(), or get_standard_model_vertices()."
+    )
+
+
+def _value(obj, *names, default=None):
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj[name]
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return default
+
+
+def _vertex_id(vertex, fallback: str) -> str:
+    return str(
+        _value(
+            vertex,
+            "vertex_id",
+            "id",
+            "name",
+            "identifier",
+            default=fallback,
+        )
+    )
+
+
+def _vertex_particles(vertex) -> tuple[str, ...]:
+    particles = _value(
+        vertex,
+        "particles",
+        "fields",
+        "legs",
+        "particle_fields",
+        default=None,
+    )
+
+    if particles is None:
+        raise RuntimeError(
+            f"Vertex {_vertex_id(vertex, '?')} has no particle/field list."
+        )
+
+    result = []
+
+    for particle in particles:
+        if isinstance(particle, dict):
+            particle = _value(
+                particle,
+                "particle",
+                "field",
+                "name",
+                "id",
+                default=None,
+            )
+
+        if particle is None:
+            raise RuntimeError(
+                f"Vertex {_vertex_id(vertex, '?')} contains an invalid particle."
+            )
+
+        result.append(_normalize_particle(str(particle)))
+
+    return tuple(result)
+
+
+def _vertex_theory(vertex) -> str:
+    return str(
+        _value(
+            vertex,
+            "theory",
+            "sector",
+            "interaction",
+            default="standard_model",
+        )
+    )
+
+
+def _catalog_vertices() -> tuple[VertexInstance, ...]:
+    catalog = _load_catalog()
+
+    if isinstance(catalog, dict):
+        iterable = catalog.values()
+    else:
+        iterable = catalog
+
+    result = []
+
+    for index, vertex in enumerate(iterable):
+        vertex_id = _vertex_id(vertex, f"vertex_{index}")
+        particles = _vertex_particles(vertex)
+        theory = _vertex_theory(vertex)
+
+        if len(particles) < 3:
+            continue
+
+        result.append(
+            VertexInstance(
+                instance_id=f"catalog:{vertex_id}",
+                catalog_vertex_id=vertex_id,
+                particles=particles,
+                theory=theory,
+            )
+        )
+
+    return tuple(result)
+
+
+# ============================================================
+# External process parsing
+# ============================================================
+
+def _external_legs(
+    incoming: Iterable[str],
+    outgoing: Iterable[str],
+) -> tuple[ExternalLeg, ...]:
+    result = []
+
+    for index, particle in enumerate(incoming, start=1):
+        particle = _normalize_particle(particle)
+
+        result.append(
+            ExternalLeg(
+                leg_id=f"in{index}",
+                particle=particle,
+                role="incoming",
+                crossed_field=crossed_field(particle, "incoming"),
+            )
+        )
+
+    for index, particle in enumerate(outgoing, start=1):
+        particle = _normalize_particle(particle)
+
+        result.append(
+            ExternalLeg(
+                leg_id=f"out{index}",
+                particle=particle,
+                role="outgoing",
+                crossed_field=crossed_field(particle, "outgoing"),
+            )
+        )
+
+    return tuple(result)
+
+
+def _process_string(
+    incoming: tuple[str, ...],
+    outgoing: tuple[str, ...],
+) -> str:
+    return (
+        " ".join(incoming)
+        + " -> "
+        + " ".join(outgoing)
+    )
+
+
+# ============================================================
+# Vertex matching
+# ============================================================
+
+def _multiset_equal(a: Iterable[str], b: Iterable[str]) -> bool:
+    return sorted(a) == sorted(b)
+
+
+def _remaining_fields(
+    vertex: VertexInstance,
+    attached_fields: Iterable[str],
+) -> tuple[str, ...] | None:
+    """
+    Remove the requested external fields from a vertex's field multiset.
+
+    This is intentionally multiset-based so vertices containing repeated
+    fields are handled correctly.
+    """
+    available = list(vertex.particles)
+
+    for field in attached_fields:
+        field = _normalize_particle(field)
+
+        try:
+            index = available.index(field)
+        except ValueError:
+            return None
+
+        available.pop(index)
+
+    return tuple(available)
+
+
+def _internal_fields_compatible(
+    field_a: str,
+    field_b: str,
+) -> bool:
+    field_a = _normalize_particle(field_a)
+    field_b = _normalize_particle(field_b)
+
+    if field_a == field_b:
+        return True
+
+    if is_self_conjugate(field_a) and is_self_conjugate(field_b):
+        return field_a == field_b
+
+    return conjugate(field_a) == field_b
+
+
+def _internal_orientation(
+    field_a: str,
+    field_b: str,
+) -> str | None:
+    if not is_fermion(field_a) or not is_fermion(field_b):
+        return None
+
+    if field_a == field_b:
+        return "same-field"
+
+    if conjugate(field_a) == field_b:
+        return "conjugate-pair"
+
+    return "invalid"
+
+
+def _vertex_can_attach(
+    vertex: VertexInstance,
+    external_fields: Iterable[str],
+) -> bool:
+    remaining = _remaining_fields(vertex, external_fields)
+
+    if remaining is None:
+        return False
+
+    return len(remaining) >= 1
+
+
+# ============================================================
+# Generic tree topology construction
+# ============================================================
+
+def _partition_external_legs(
+    legs: tuple[ExternalLeg, ...],
+    vertex_count: int,
+    arities: tuple[int, ...],
+):
+    """
+    Generate assignments of external legs to vertices.
+
+    For a tree with V vertices and E external legs:
+
+        sum(vertex arity) = E + 2(V - 1)
+
+    because every internal propagator contributes two endpoints.
+
+    Therefore each vertex receives:
+
+        arity(vertex) - internal_degree(vertex)
+
+    external legs.
+
+    This function generates external-leg assignments for tree searches
+    without assuming every vertex is trivalent.
+    """
+    if len(arities) != vertex_count:
+        return
+
+    # A connected tree with V vertices has V-1 internal edges.
+    # We generate tree degree sequences first.
+    if vertex_count == 1:
+        degree_sequences = [(0,)]
+    else:
+        degree_sequences = []
+
+        # Prüfer-style degree generation through all labeled trees.
+        # For V <= 8 this is tractable and keeps the engine generic.
+        for parent_edges in _labeled_trees(vertex_count):
+            degrees = [0] * vertex_count
+
+            for a, b in parent_edges:
+                degrees[a] += 1
+                degrees[b] += 1
+
+            degree_sequences.append(tuple(degrees))
+
+    seen = set()
+
+    for degrees in degree_sequences:
+        external_counts = tuple(
+            arities[i] - degrees[i]
+            for i in range(vertex_count)
+        )
+
+        if any(count < 0 for count in external_counts):
+            continue
+
+        if sum(external_counts) != len(legs):
+            continue
+
+        key = external_counts
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        yield external_counts
+
+
+def _labeled_trees(vertex_count: int):
+    """
+    Generate all labeled trees using Prüfer sequences.
+    """
+    if vertex_count == 1:
+        yield ()
+        return
+
+    if vertex_count == 2:
+        yield ((0, 1),)
+        return
+
+    import itertools
+
+    for sequence in itertools.product(
+        range(vertex_count),
+        repeat=vertex_count - 2,
+    ):
+        degree = [1] * vertex_count
+
+        for node in sequence:
+            degree[node] += 1
+
+        edges = []
+        seq = list(sequence)
+
+        for node in seq:
+            leaf = min(
+                i for i in range(vertex_count)
+                if degree[i] == 1
+            )
+
+            edges.append((leaf, node))
+            degree[leaf] -= 1
+            degree[node] -= 1
+
+        remaining = [
+            i for i in range(vertex_count)
+            if degree[i] == 1
+        ]
+
+        edges.append((remaining[0], remaining[1]))
+
+        yield tuple(sorted(edges))
+
+
+def _assign_external_legs(
+    legs: tuple[ExternalLeg, ...],
+    counts: tuple[int, ...],
+):
+    """
+    Assign physical external legs to vertex slots.
+
+    The algorithm does not assume a particular channel.
+    """
+    if sum(counts) != len(legs):
+        return
+
+    vertex_count = len(counts)
+    used = set()
+
+    def recurse(vertex_index, remaining):
+        if vertex_index == vertex_count:
+            yield tuple(remaining)
+            return
+
+        count = counts[vertex_index]
+
+        for selected in combinations(remaining, count):
+            selected_set = set(selected)
+
+            new_remaining = tuple(
+                leg for leg in remaining
+                if leg not in selected_set
+            )
+
+            yield from recurse(
+                vertex_index + 1,
+                new_remaining,
+            )
+
+    yield from recurse(0, legs)
+
+
+
+def _oriented_vertex_variants(vertex: VertexInstance) -> tuple[VertexInstance, ...]:
+    """
+    Return the original and fully charge-conjugated orientations of a
+    physical catalog vertex.
+
+    This allows the generic topology engine to handle crossed fermion
+    external legs without adding process-specific rules.
+    """
+    original = tuple(
+        _normalize_particle(field)
+        for field in vertex.particles
+    )
+
+    conjugated = tuple(
+        _normalize_particle(conjugate(field))
+        for field in original
+    )
+
+    variants = [
+        VertexInstance(
+            instance_id=vertex.instance_id,
+            catalog_vertex_id=vertex.catalog_vertex_id,
+            particles=original,
+            theory=vertex.theory,
+        )
+    ]
+
+    if conjugated != original:
+        variants.append(
+            VertexInstance(
+                instance_id=f"{vertex.instance_id}__conjugated",
+                catalog_vertex_id=vertex.catalog_vertex_id,
+                particles=conjugated,
+                theory=vertex.theory,
+            )
+        )
+
+    return tuple(variants)
+
+def _build_candidate(
+    incoming: tuple[str, ...],
+    outgoing: tuple[str, ...],
+    vertices: tuple[VertexInstance, ...],
+    tree_edges: tuple[tuple[int, int], ...],
+    external_groups: tuple[tuple[ExternalLeg, ...], ...],
+) -> TreeTopologyCandidate | None:
+
+    # Every vertex has a fixed degree from the tree.
+    degrees = [0] * len(vertices)
+
+    for a, b in tree_edges:
+        degrees[a] += 1
+        degrees[b] += 1
+
+    # Verify that the external groups fit the vertex arities.
+    for index, vertex in enumerate(vertices):
+        if len(external_groups[index]) + degrees[index] != len(vertex.particles):
+            return None
+
+    attachments = []
+
+    for vertex_index, group in enumerate(external_groups):
+        vertex = vertices[vertex_index]
+
+        fields = [
+            leg.crossed_field
+            for leg in group
+        ]
+
+        if _remaining_fields(vertex, fields) is None:
+            return None
+
+        for leg in group:
+            attachments.append(
+                ExternalAttachment(
+                    leg_id=leg.leg_id,
+                    vertex_instance=vertex.instance_id,
+                    physical_particle=leg.particle,
+                    crossed_field=leg.crossed_field,
+                    role=leg.role,
+                )
+            )
+
+    propagators = []
+
+    for edge_index, (a, b) in enumerate(tree_edges):
+        vertex_a = vertices[a]
+        vertex_b = vertices[b]
+
+        fields_a = [
+            leg.crossed_field
+            for leg in external_groups[a]
+        ]
+
+        fields_b = [
+            leg.crossed_field
+            for leg in external_groups[b]
+        ]
+
+        remaining_a = _remaining_fields(vertex_a, fields_a)
+        remaining_b = _remaining_fields(vertex_b, fields_b)
+
+        if remaining_a is None or remaining_b is None:
+            return None
+
+        if len(remaining_a) != degrees[a]:
+            return None
+
+        if len(remaining_b) != degrees[b]:
+            return None
+
+    # Solve internal fields edge-by-edge.
+    #
+    # For a tree, each vertex can have several internal endpoints.
+    # We need to assign the remaining vertex fields to those edges.
+    #
+    # Generate all local permutations and retain only globally
+    # compatible assignments.
+    local_remaining = []
+
+    for vertex_index, vertex in enumerate(vertices):
+        fields = [
+            leg.crossed_field
+            for leg in external_groups[vertex_index]
+        ]
+
+        remaining = _remaining_fields(vertex, fields)
+
+        if remaining is None:
+            return None
+
+        local_remaining.append(list(remaining))
+
+    edge_field_options = []
+
+    for edge_index, (a, b) in enumerate(tree_edges):
+        options = []
+
+        for field_a in local_remaining[a]:
+            for field_b in local_remaining[b]:
+                if _internal_fields_compatible(field_a, field_b):
+                    options.append((field_a, field_b))
+
+        if not options:
+            return None
+
+        edge_field_options.append(options)
+
+    for selected in product(*edge_field_options):
+        used_a = [[] for _ in vertices]
+        used_b = [[] for _ in vertices]
+
+        valid = True
+
+        for edge_index, ((a, b), pair) in enumerate(
+            zip(tree_edges, selected)
+        ):
+            field_a, field_b = pair
+
+            used_a[a].append(field_a)
+            used_b[b].append(field_b)
+
+        for vertex_index in range(len(vertices)):
+            remaining = list(local_remaining[vertex_index])
+
+            for field in used_a[vertex_index] + used_b[vertex_index]:
+                try:
+                    remaining.remove(field)
+                except ValueError:
+                    valid = False
+                    break
+
+            if remaining:
+                valid = False
+
+            if not valid:
+                break
+
+        if not valid:
+            continue
+
+        for edge_index, ((a, b), pair) in enumerate(
+            zip(tree_edges, selected)
+        ):
+            field_a, field_b = pair
+
+            canonical_field = (
+                field_a
+                if field_a <= field_b
+                else field_b
+            )
+
+            orientation = _internal_orientation(
+                field_a,
+                field_b,
+            )
+
+            propagators.append(
+                InternalPropagator(
+                    line_id=f"L{edge_index + 1}",
+                    particle=canonical_field,
+                    field_type=canonical_field,
+                    vertex_a=vertices[a].instance_id,
+                    vertex_b=vertices[b].instance_id,
+                    orientation=orientation,
+                )
+            )
+
+        break
+    else:
+        return None
+
+    fermion_lines = _build_fermion_lines(
+        vertices,
+        tuple(attachments),
+        tuple(propagators),
+    )
+
+    topology = _derive_topology_name(
+        incoming,
+        outgoing,
+        vertices,
+        external_groups,
+        tree_edges,
+    )
+
+    candidate = TreeTopologyCandidate(
+        candidate_id="",
+        process=_process_string(incoming, outgoing),
+        topology=topology,
+        theory="standard_model",
+        vertices=vertices,
+        external_attachments=tuple(
+            sorted(
+                attachments,
+                key=lambda x: x.leg_id,
+            )
+        ),
+        internal_propagators=tuple(propagators),
+        fermion_lines=tuple(fermion_lines),
+        status="candidate",
+        reason="Generated by the generic tree-topology engine.",
+    )
+
+    candidate_id = _canonical_candidate_id(candidate)
+
+    return TreeTopologyCandidate(
+        candidate_id=candidate_id,
+        process=candidate.process,
+        topology=candidate.topology,
+        theory=candidate.theory,
+        vertices=candidate.vertices,
+        external_attachments=candidate.external_attachments,
+        internal_propagators=candidate.internal_propagators,
+        fermion_lines=candidate.fermion_lines,
+        status=candidate.status,
+        reason=candidate.reason,
+    )
+
+
+def _build_fermion_lines(
+    vertices: tuple[VertexInstance, ...],
+    attachments: tuple[ExternalAttachment, ...],
+    propagators: tuple[InternalPropagator, ...],
+) -> tuple[FermionLine, ...]:
+    result = []
+
+    # External fermion legs are associated by family and by the vertex
+    # graph. This layer records candidate flow; the physical validator
+    # performs the final orientation check.
+    fermion_attachments = [
+        a
+        for a in attachments
+        if is_fermion(a.crossed_field)
+    ]
+
+    grouped = {}
+
+    for attachment in fermion_attachments:
+        family = FERMION_FAMILY.get(
+            attachment.physical_particle,
+            attachment.physical_particle,
+        )
+        grouped.setdefault(family, []).append(attachment)
+
+    line_index = 1
+
+    for family, items in grouped.items():
+        incoming_items = [
+            x for x in items
+            if x.role == "incoming"
+        ]
+
+        outgoing_items = [
+            x for x in items
+            if x.role == "outgoing"
+        ]
+
+        used_out = set()
+
+        for incoming_item in incoming_items:
+            partner = None
+
+            for outgoing_item in outgoing_items:
+                if outgoing_item.leg_id in used_out:
+                    continue
+
+                outgoing_family = FERMION_FAMILY.get(
+                    outgoing_item.physical_particle,
+                    outgoing_item.physical_particle,
+                )
+
+                if outgoing_family == family:
+                    partner = outgoing_item
+                    break
+
+            if partner is not None:
+                used_out.add(partner.leg_id)
+
+                result.append(
+                    FermionLine(
+                        line_id=f"F{line_index}",
+                        family=family,
+                        incoming_leg=incoming_item.leg_id,
+                        outgoing_leg=partner.leg_id,
+                        start_vertex=incoming_item.vertex_instance,
+                        end_vertex=partner.vertex_instance,
+                        orientation="incoming-to-outgoing",
+                    )
+                )
+
+                line_index += 1
+
+    return tuple(result)
+
+
+# ============================================================
+# Topology naming
+# ============================================================
+
+def _derive_topology_name(
+    incoming,
+    outgoing,
+    vertices,
+    groups,
+    tree_edges,
+) -> str:
+    if len(vertices) == 1:
+        return "contact"
+
+    if len(vertices) == 2:
+        # Identify the partition of external legs between the two
+        # vertices. For 2->2 processes this maps naturally to s/t/u.
+        left = {
+            leg.leg_id
+            for leg in groups[0]
+        }
+
+        incoming_ids = {
+            f"in{i}"
+            for i in range(1, len(incoming) + 1)
+        }
+
+        if left == incoming_ids:
+            return "s"
+
+        if any(
+            leg_id.startswith("in")
+            for leg_id in left
+        ) and any(
+            leg_id.startswith("out")
+            for leg_id in left
+        ):
+            return "t"
+
+        return "u"
+
+    return f"tree_{len(vertices)}_vertices"
+
+
+# ============================================================
+# Canonicalization
+# ============================================================
+
+def _canonical_candidate_id(
+    candidate: TreeTopologyCandidate,
+) -> str:
+    vertex_labels = tuple(
+        sorted(
+            (
+                vertex.catalog_vertex_id,
+                vertex.particles,
+            )
+            for vertex in candidate.vertices
+        )
+    )
+
+    attachments = tuple(
+        sorted(
+            (
+                attachment.leg_id,
+                attachment.physical_particle,
+                attachment.crossed_field,
+                attachment.vertex_instance,
+            )
+            for attachment in candidate.external_attachments
+        )
+    )
+
+    propagators = tuple(
+        sorted(
+            (
+                prop.particle,
+                min(prop.vertex_a, prop.vertex_b),
+                max(prop.vertex_a, prop.vertex_b),
+            )
+            for prop in candidate.internal_propagators
+        )
+    )
+
+    return (
+        f"{candidate.topology}|"
+        f"V={repr(vertex_labels)}|"
+        f"A={repr(attachments)}|"
+        f"P={repr(propagators)}"
+    )
+
+
+# ============================================================
+# General tree search
+# ============================================================
+
+
+def search_tree_topologies(
+    incoming: Iterable[str],
+    outgoing: Iterable[str],
+    *,
+    max_vertices: int = 4,
+) -> tuple[TreeTopologyCandidate, ...]:
+    """
+    General multi-vertex tree-topology search.
+
+    Every catalog interaction is searched in both its original field
+    orientation and its fully charge-conjugated orientation when distinct.
+
+    Physical legality remains the responsibility of the physical validator.
+    """
+    incoming = tuple(
+        _normalize_particle(x)
+        for x in incoming
+    )
+
+    outgoing = tuple(
+        _normalize_particle(x)
+        for x in outgoing
+    )
+
+    legs = _external_legs(incoming, outgoing)
+    catalog = _catalog_vertices()
+
+    oriented_catalog = []
+
+    for vertex in catalog:
+        oriented_catalog.extend(
+            _oriented_vertex_variants(vertex)
+        )
+
+    candidates = {}
+    vertex_count_limit = max(1, int(max_vertices))
+
+    catalog_arities = tuple(
+        len(vertex.particles)
+        for vertex in oriented_catalog
+    )
+
+    min_arity = min(catalog_arities) if catalog_arities else 0
+    max_arity = max(catalog_arities) if catalog_arities else 0
+
+    for vertex_count in range(1, vertex_count_limit + 1):
+
+        if vertex_count > len(legs) and vertex_count > 1:
+            continue
+
+        required_total_arity = len(legs) + 2 * (vertex_count - 1)
+
+        if required_total_arity < vertex_count * min_arity:
+            continue
+
+        if required_total_arity > vertex_count * max_arity:
+            continue
+
+        for vertex_indices in _vertex_multicombinations(
+            len(oriented_catalog),
+            vertex_count,
+        ):
+            vertices = tuple(
+                oriented_catalog[index]
+                for index in vertex_indices
+            )
+
+            arities = tuple(
+                len(vertex.particles)
+                for vertex in vertices
+            )
+
+            for tree_edges in _unique_tree_shapes(vertex_count):
+
+                degrees = [0] * vertex_count
+
+                for a, b in tree_edges:
+                    degrees[a] += 1
+                    degrees[b] += 1
+
+                external_counts = tuple(
+                    arities[i] - degrees[i]
+                    for i in range(vertex_count)
+                )
+
+                if any(count < 0 for count in external_counts):
+                    continue
+
+                if sum(external_counts) != len(legs):
+                    continue
+
+                for groups in _external_group_assignments(
+                    legs,
+                    external_counts,
+                ):
+                    candidate = _build_candidate(
+                        incoming,
+                        outgoing,
+                        vertices,
+                        tree_edges,
+                        groups,
+                    )
+
+                    if candidate is None:
+                        continue
+
+                    candidates[candidate.candidate_id] = candidate
+
+    return tuple(
+        sorted(
+            candidates.values(),
+            key=lambda candidate: (
+                candidate.topology,
+                candidate.candidate_id,
+            ),
+        )
+    )
+
+
+
+def _vertex_multicombinations(
+    count: int,
+    size: int,
+):
+    if size == 0:
+        yield ()
+        return
+
+    def recurse(start, depth, current):
+        if depth == size:
+            yield tuple(current)
+            return
+
+        for index in range(start, count):
+            current.append(index)
+            yield from recurse(
+                index,
+                depth + 1,
+                current,
+            )
+            current.pop()
+
+    yield from recurse(0, 0, [])
+
+
+def _unique_tree_shapes(vertex_count: int):
+    if vertex_count == 1:
+        yield ()
+        return
+
+    seen = set()
+
+    for edges in _labeled_trees(vertex_count):
+        normalized = tuple(
+            sorted(
+                (min(a, b), max(a, b))
+                for a, b in edges
+            )
+        )
+
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+        yield normalized
+
+
+def _external_group_assignments(
+    legs: tuple[ExternalLeg, ...],
+    counts: tuple[int, ...],
+):
+    if sum(counts) != len(legs):
+        return
+
+    def recurse(
+        vertex_index,
+        remaining,
+        groups,
+    ):
+        if vertex_index == len(counts):
+            if not remaining:
+                yield tuple(groups)
+            return
+
+        count = counts[vertex_index]
+
+        for selected in combinations(
+            remaining,
+            count,
+        ):
+            selected_set = set(selected)
+
+            next_remaining = tuple(
+                leg
+                for leg in remaining
+                if leg not in selected_set
+            )
+
+            groups.append(tuple(selected))
+
+            yield from recurse(
+                vertex_index + 1,
+                next_remaining,
+                groups,
+            )
+
+            groups.pop()
+
+    yield from recurse(0, legs, [])
+
+
+# ============================================================
+# Compatibility API
+# ============================================================
+
+def search_oriented_two_vertex_graphs(
+    incoming: Iterable[str],
+    outgoing: Iterable[str],
+) -> tuple[TreeTopologyCandidate, ...]:
+    """
+    Backwards-compatible wrapper.
+
+    IMPORTANT:
+    This function now uses the same general graph engine, restricted
+    to exactly two vertices for callers that still use the old API.
+    """
+    all_candidates = search_tree_topologies(
+        incoming,
+        outgoing,
+        max_vertices=2,
+    )
+
+    return tuple(
+        candidate
+        for candidate in all_candidates
+        if len(candidate.vertices) == 2
+    )
+
+
+def oriented_graph_summary(
+    incoming: Iterable[str],
+    outgoing: Iterable[str],
+    *,
+    max_vertices: int = 4,
+):
+    candidates = search_tree_topologies(
+        incoming,
+        outgoing,
+        max_vertices=max_vertices,
+    )
+
+    return {
+        "process": _process_string(
+            tuple(_normalize_particle(x) for x in incoming),
+            tuple(_normalize_particle(x) for x in outgoing),
+        ),
+        "candidate_count": len(candidates),
+        "candidates": [
+            {
+                "candidate_id": candidate.candidate_id,
+                "topology": candidate.topology,
+                "vertices": [
+                    {
+                        "instance_id": vertex.instance_id,
+                        "catalog_vertex_id": vertex.catalog_vertex_id,
+                        "particles": list(vertex.particles),
+                        "theory": vertex.theory,
+                    }
+                    for vertex in candidate.vertices
+                ],
+                "external_attachments": [
+                    {
+                        "leg_id": attachment.leg_id,
+                        "vertex_instance": attachment.vertex_instance,
+                        "physical_particle": attachment.physical_particle,
+                        "crossed_field": attachment.crossed_field,
+                        "role": attachment.role,
+                    }
+                    for attachment in candidate.external_attachments
+                ],
+                "internal_propagators": [
+                    {
+                        "line_id": propagator.line_id,
+                        "particle": propagator.particle,
+                        "field_type": propagator.field_type,
+                        "vertex_a": propagator.vertex_a,
+                        "vertex_b": propagator.vertex_b,
+                        "orientation": propagator.orientation,
+                    }
+                    for propagator in candidate.internal_propagators
+                ],
+                "fermion_lines": [
+                    {
+                        "line_id": line.line_id,
+                        "family": line.family,
+                        "incoming_leg": line.incoming_leg,
+                        "outgoing_leg": line.outgoing_leg,
+                        "start_vertex": line.start_vertex,
+                        "end_vertex": line.end_vertex,
+                        "orientation": line.orientation,
+                    }
+                    for line in candidate.fermion_lines
+                ],
+                "status": candidate.status,
+                "reason": candidate.reason,
+            }
+            for candidate in candidates
+        ],
+    }

@@ -1,0 +1,180 @@
+﻿from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .oriented_vertex_graph import (
+    TreeTopologyCandidate,
+    _normalize_particle,
+    conjugate,
+    is_self_conjugate,
+)
+
+
+@dataclass(frozen=True)
+class VertexOrientationResult:
+    status: str
+    reasons: tuple[str, ...]
+
+
+def _normalized_fields(fields) -> tuple[str, ...]:
+    return tuple(
+        _normalize_particle(field)
+        for field in fields
+    )
+
+
+def _field_matches(
+    physical_particle: str,
+    crossed_field: str,
+) -> bool:
+    physical = _normalize_particle(physical_particle)
+    crossed = _normalize_particle(crossed_field)
+
+    if physical == crossed:
+        return True
+
+    try:
+        return conjugate(physical) == crossed
+    except Exception:
+        return False
+
+
+def _attachments_for_vertex(
+    candidate: TreeTopologyCandidate,
+    vertex_id: str,
+):
+    return tuple(
+        attachment
+        for attachment in candidate.external_attachments
+        if attachment.vertex_instance == vertex_id
+    )
+
+
+def _propagators_for_vertex(
+    candidate: TreeTopologyCandidate,
+    vertex_id: str,
+):
+    return tuple(
+        propagator
+        for propagator in candidate.internal_propagators
+        if (
+            propagator.vertex_a == vertex_id
+            or propagator.vertex_b == vertex_id
+        )
+    )
+
+
+def validate_vertex_orientation(
+    candidate: TreeTopologyCandidate,
+    vertex,
+) -> VertexOrientationResult:
+    reasons: list[str] = []
+
+    fields = _normalized_fields(vertex.particles)
+
+    # Check every external attachment against the fields of the
+    # catalog vertex. Physical particles may appear as crossed
+    # conjugate fields.
+    for attachment in _attachments_for_vertex(
+        candidate,
+        vertex.instance_id,
+    ):
+        if not _field_matches(
+            attachment.physical_particle,
+            attachment.crossed_field,
+        ):
+            reasons.append(
+                f"External leg {attachment.leg_id} has physical particle "
+                f"{attachment.physical_particle} incompatible with crossed "
+                f"field {attachment.crossed_field} at vertex "
+                f"{vertex.instance_id}."
+            )
+
+    # Internal propagators:
+    #
+    # Self-conjugate fields do not require an orientation.
+    #
+    # Examples:
+    #   photon
+    #   gluon
+    #   Z
+    #   Higgs
+    #
+    # Non-self-conjugate fields such as W+/W- require an orientation
+    # unless the graph engine has already supplied one.
+    undecidable = False
+
+    for propagator in _propagators_for_vertex(
+        candidate,
+        vertex.instance_id,
+    ):
+        particle = _normalize_particle(
+            propagator.particle
+        )
+
+        if is_self_conjugate(particle):
+            continue
+
+        if propagator.orientation is None:
+            undecidable = True
+
+    if reasons:
+        return VertexOrientationResult(
+            status="FORBIDDEN",
+            reasons=tuple(reasons),
+        )
+
+    if undecidable:
+        return VertexOrientationResult(
+            status="UNDECIDABLE",
+            reasons=(
+                "A non-self-conjugate internal field has no explicit "
+                "field orientation yet.",
+            ),
+        )
+
+    return VertexOrientationResult(
+        status="ALLOWED",
+        reasons=(),
+    )
+
+
+def validate_candidate_vertex_orientations(
+    candidate: TreeTopologyCandidate,
+) -> tuple[VertexOrientationResult, ...]:
+    return tuple(
+        validate_vertex_orientation(candidate, vertex)
+        for vertex in candidate.vertices
+    )
+
+
+def candidate_orientation_status(
+    candidate: TreeTopologyCandidate,
+) -> tuple[str, tuple[str, ...]]:
+    results = validate_candidate_vertex_orientations(candidate)
+
+    forbidden: list[str] = []
+    undecidable: list[str] = []
+
+    for result in results:
+        if result.status == "FORBIDDEN":
+            forbidden.extend(result.reasons)
+        elif result.status == "UNDECIDABLE":
+            undecidable.extend(result.reasons)
+
+    if forbidden:
+        return "FORBIDDEN", tuple(forbidden)
+
+    if undecidable:
+        return "UNDECIDABLE", tuple(undecidable)
+
+    return "ALLOWED", ()
+
+
+def validate_candidates_orientation(
+    candidates,
+):
+    return tuple(
+        candidate_orientation_status(candidate)
+        for candidate in candidates
+    )
